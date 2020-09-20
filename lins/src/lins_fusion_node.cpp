@@ -20,6 +20,9 @@
 #include <parameters.h>
 #include <Estimator.h>
 
+/**
+ * 程序的总入口，调用Estimator.cpp中的fusion::LinsFusion类启动程序
+ */
 int main(int argc, char** argv) {
   ros::init(argc, argv, "lins_fusion_node");
   ros::NodeHandle nh;

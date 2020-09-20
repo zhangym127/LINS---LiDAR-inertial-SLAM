@@ -67,6 +67,7 @@ class GlobalState {
     gn_ << 0.0, 0.0, -G0;
   }
 
+  /* 完成ESKF的⊕操作 */
   // boxPlus operator
   void boxPlus(const Eigen::Matrix<double, DIM_OF_STATE_, 1>& xk,
                GlobalState& stateOut) {
@@ -106,13 +107,13 @@ class GlobalState {
     return *this;
   }
 
-  // !@State
-  V3D rn_;   // position in n-frame
-  V3D vn_;   // velocity in n-frame
-  Q4D qbn_;  // rotation from b-frame to n-frame
-  V3D ba_;   // acceleartion bias
-  V3D bw_;   // gyroscope bias
-  V3D gn_;   // gravity
+  // !@State ESKF的标称状态变量X
+  V3D rn_;   // position in n-frame 当前位置
+  V3D vn_;   // velocity in n-frame 当前速度
+  Q4D qbn_;  // rotation from b-frame to n-frame 从起点到当前的旋转
+  V3D ba_;   // acceleartion bias 加速度偏差
+  V3D bw_;   // gyroscope bias 角速度偏差
+  V3D gn_;   // gravity 重力加速度
 };
 
 class StatePredictor {
@@ -122,6 +123,7 @@ class StatePredictor {
 
   ~StatePredictor() {}
 
+  /** ESKF的预测过程 */
   bool predict(double dt, const V3D& acc, const V3D& gyr,
                bool update_jacobian_ = true) {
     if (!isInitialized()) return false;
@@ -134,32 +136,47 @@ class StatePredictor {
 
     // Average acceleration and angular rate
     GlobalState state_tmp = state_;
+	/* 将前一状态的acc转到世界坐标系，考虑偏差和重力加速度在内 */
     V3D un_acc_0 = state_tmp.qbn_ * (acc_last - state_tmp.ba_) + state_tmp.gn_;
+	/* 对前一状态的gyr和当前状态的gyr求均值，考虑了偏差在内 */
     V3D un_gyr = 0.5 * (gyr_last + gyr) - state_tmp.bw_;
+	/* 将gyr的均值乘以dt转成四元数形式的旋转增量 */
     Q4D dq = axis2Quat(un_gyr * dt);
+	/* 将旋转增量叠加到已有的旋转状态变量，获得当前状态对应的旋转变量 */
     state_tmp.qbn_ = (state_tmp.qbn_ * dq).normalized();
+	/* 将当前状态的acc转到世界坐标系，考虑偏差和重力加速度在内 */
     V3D un_acc_1 = state_tmp.qbn_ * (acc - state_tmp.ba_) + state_tmp.gn_;
+	/* 对转成世界坐标系的前一状态acc和当前状态acc求均值 */
     V3D un_acc = 0.5 * (un_acc_0 + un_acc_1);
 
     // State integral
+	/* 更新标称状态的位置和速度S=s0+vt+att/2 */
     state_tmp.rn_ = state_tmp.rn_ + dt * state_tmp.vn_ + 0.5 * dt * dt * un_acc;
     state_tmp.vn_ = state_tmp.vn_ + dt * un_acc;
 
+	/* 构造ESKF的雅克比矩阵Fx，即状态转移矩阵，或基本矩阵，尺度是18×18 */
     if (update_jacobian_) {
+	  /* 首先构造系统动力学矩阵A
+	   * FIXME: 与ESKF文献唯一有区别的地方是A[6,6]项，多了一个负号，为什么？ */
       MXD Ft =
           MXD::Zero(GlobalState::DIM_OF_STATE_, GlobalState::DIM_OF_STATE_);
+	  /* A[0,3] = I */
       Ft.block<3, 3>(GlobalState::pos_, GlobalState::vel_) = M3D::Identity();
-
+	  /* A[3,6] = -q.toMatrix * acc  */
       Ft.block<3, 3>(GlobalState::vel_, GlobalState::att_) =
           -state_tmp.qbn_.toRotationMatrix() * skew(acc - state_tmp.ba_);
+	  /* A[3,9] = -q.toMatrix        */
       Ft.block<3, 3>(GlobalState::vel_, GlobalState::acc_) =
           -state_tmp.qbn_.toRotationMatrix();
+	  /* A[3,15] = I */
       Ft.block<3, 3>(GlobalState::vel_, GlobalState::gra_) = M3D::Identity();
-
+	  /* A[6,6] = gyr - bias */
       Ft.block<3, 3>(GlobalState::att_, GlobalState::att_) =
           - skew(gyr - state_tmp.bw_);
+	  /* A[6,12] = -I */
       Ft.block<3, 3>(GlobalState::att_, GlobalState::gyr_) = -M3D::Identity();
 
+	  /* 构造ESKF的扰动矩阵Fi，尺度是18×12 */
       MXD Gt =
           MXD::Zero(GlobalState::DIM_OF_STATE_, GlobalState::DIM_OF_NOISE_);
       Gt.block<3, 3>(GlobalState::vel_, 0) = -state_tmp.qbn_.toRotationMatrix();
@@ -168,11 +185,16 @@ class StatePredictor {
       Gt.block<3, 3>(GlobalState::gyr_, 9) = M3D::Identity();
       Gt = Gt * dt;
 
+	  /* 构造状态转移矩阵，采用矩阵幂级数展开的方式，取级数的前三部分，获得更高的近似精度
+	   * F = I + A*dt + A*A*dt*dt/2 */
       const MXD I =
           MXD::Identity(GlobalState::DIM_OF_STATE_, GlobalState::DIM_OF_STATE_);
       F_ = I + Ft * dt + 0.5 * Ft * Ft * dt * dt;
 
+	  // 下面的步骤被省略
+	  // δx = F * δx
       // jacobian_ = F * jacobian_;
+	  /* P = F * P * F.transpose() + Q */
       covariance_ =
           F_ * covariance_ * F_.transpose() + Gt * noise_ * Gt.transpose();
       covariance_ = 0.5 * (covariance_ + covariance_.transpose()).eval();

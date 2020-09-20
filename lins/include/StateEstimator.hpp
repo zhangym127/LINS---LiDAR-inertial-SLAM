@@ -283,9 +283,13 @@ class StateEstimator {
     TicToc ts_fea;  // Calculate the time used in feature extraction
     scan_new_->setPointCloud(time, distortedPointCloud, cloudInfo,
                              outlierPointCloud);
+	/* 进行点云的帧内校正 */
     undistortPcl(scan_new_);
+	/* 计算点云的曲率 */
     calculateSmoothness(scan_new_);
+	/* 对点云扫描线上的凹陷区域和离点进行标识，排除在提取特征点的范围之外 */
     markOccludedPoints(scan_new_);
+	/* 提取Sharp、LessSharp、Flat、LessFlat四种特征点云 */
     extractFeatures(scan_new_);
     imu_last_ = imu;
     double time_fea = ts_fea.toc();
@@ -487,6 +491,11 @@ class StateEstimator {
           ROS_WARN("Insufficient matched surfs...");
         }
       }
+	  
+	  /* 遍历当前特征点云，对点云中的每一个点p，在上一帧点云中查找最近的线段ab，
+	   * 将点p到ab的垂线向量以及距离构造成一个点，添加到jacobianCoffCorns中，对
+	   * 应的点p添加到keypointCorns_中，keypointCorns_和jacobianCoffCorns都是点
+	   * 云格式。*/
       findCorrespondingCornerFeatures(scan_last_, scan_new_, keypointCorns_,
                                       jacobianCoffCorns, iter);
       if (keypointCorns_->points.size() < 5) {
@@ -545,7 +554,20 @@ class StateEstimator {
       Py_.llt().solveInPlace(Pyinv_);
       Kk_ = Pk_ * Hk_.transpose() * Pyinv_;  // K = P*H.transpose()*S.inverse()
 
+	  /* difVecLinInv_ = filterState - linState_ */
       filterState.boxMinus(linState_, difVecLinInv_);
+	  
+	  /* 下面的式子等效于：
+	   *	y=z-H*x
+	   *	x=x+K*y
+	   * 其中
+	   *    z <-- residual_
+	   *    H <-- Hk_
+	   *    x <-- difVecLinInv_
+	   *    K <-- Kk_
+	   *    x <-- updateVec_
+	   * updateVec_就是ESKF的观测误差状态，即误差状态的后验概率
+	   */
       updateVec_ = -Kk_ * (residual_ + Hk_ * difVecLinInv_) + difVecLinInv_;
 
       // Divergence determination
@@ -569,6 +591,8 @@ class StateEstimator {
         break;
       }
 
+	  /* 将观测误差注入标称状态 
+	   * linState_ = linState_ + updateVec_ */
       // Update the state
       linState_.boxPlus(updateVec_, linState_);
 
@@ -616,6 +640,10 @@ class StateEstimator {
     globalState_.gn_ = globalState_.qbn_ * filterState.gn_;
   }
 
+  /**
+   * 进行点云的帧内校正。
+   * 但是从代码来看并未进行帧内校正。
+   */
   void undistortPcl(ScanPtr scan) {
     bool halfPassed = false;
     scan->undistPointCloud_->clear();
@@ -624,10 +652,13 @@ class StateEstimator {
     int size = distPointCloud->points.size();
     PointType point;
     for (int i = 0; i < size; i++) {
-      // If LiDAR frame does not align with Vehic frame, we transform the point
+      
+	  /* 将点云从点云坐标系转到车辆坐标系 */
+	  // If LiDAR frame does not align with Vehic frame, we transform the point
       // cloud to the vehicle frame
       rotatePoint(&distPointCloud->points[i], &point);
 
+	  /* 根据点的水平方位确定该点的时间戳 */
       double ori = -atan2(point.y, point.x);
       if (!halfPassed) {
         if (ori < segInfo->startOrientation - M_PI / 2)
@@ -646,6 +677,7 @@ class StateEstimator {
       }
       double relTime =
           (ori - segInfo->startOrientation) / segInfo->orientationDiff;
+	  /* 将点的时间戳写入intensity字段 */
       point.intensity =
           int(distPointCloud->points[i].intensity) + SCAN_PERIOD * relTime;
 
@@ -653,9 +685,16 @@ class StateEstimator {
     }
   }
 
+  /**
+   * 计算点云的曲率
+   */
   void calculateSmoothness(ScanPtr scan) {
     int cloudSize = scan->undistPointCloud_->points.size();
     cloud_msgs::cloud_info::Ptr segInfo = scan->cloudInfo_;
+
+	/* segmentedCloudRange中保存的是每个点的距离，即Range，
+	 * segmentedCloudRange中的点是按照扫描线分段组织好的，
+	 * 通过计算当前点与两侧10个点的距离差，获得当前点的曲率*/
     for (int i = 5; i < cloudSize - 5; i++) {
       double diffRange = segInfo->segmentedCloudRange[i - 5] +
                          segInfo->segmentedCloudRange[i - 4] +
@@ -677,15 +716,25 @@ class StateEstimator {
     }
   }
 
+  /**
+   * 对点云扫描线上存在凹陷的区域进行标识，排除在提取特征点的范围之外
+   * 对点云扫描线上的离点进行标识，排除在提取特征点的范围之外
+   * 所谓凹陷是指从雷达的视角看过去，某个扫描线上的凹陷区域，凹陷程度
+   * （即阈值）＞0.3米
+   */
   void markOccludedPoints(ScanPtr scan) {
     int cloudSize = scan->undistPointCloud_->points.size();
     cloud_msgs::cloud_info::Ptr segInfo = scan->cloudInfo_;
     for (int i = 5; i < cloudSize - 6; ++i) {
       float depth1 = segInfo->segmentedCloudRange[i];
       float depth2 = segInfo->segmentedCloudRange[i + 1];
+	  /* 获得相邻两个点在各自扫描线内的序号差，如果同属于一个扫描线，
+	   * 则columnDiff应该等于1，否则columnDiff等于扫描线的长度减一 */
       int columnDiff = std::abs(int(segInfo->segmentedCloudColInd[i + 1] -
                                     segInfo->segmentedCloudColInd[i]));
+	  /* 确保当前点不是扫描线的端点 */
       if (columnDiff < 10) {
+		/* 以距离为尺度，标识出扫描线上存在凹陷的区域（±12个点），排除在特征点之外 */
         if (depth1 - depth2 > 0.3) {
           scan->cloudNeighborPicked_[i - 5] = 1;
           scan->cloudNeighborPicked_[i - 4] = 1;
@@ -702,6 +751,7 @@ class StateEstimator {
           scan->cloudNeighborPicked_[i + 6] = 1;
         }
       }
+	  /* 如果当前点与两侧点的距离偏差同时超过2%，即离点，排除在特征点之外 */
       float diff1 = std::abs(segInfo->segmentedCloudRange[i - 1] -
                              segInfo->segmentedCloudRange[i]);
       float diff2 = std::abs(segInfo->segmentedCloudRange[i + 1] -
@@ -712,6 +762,9 @@ class StateEstimator {
     }
   }
 
+ /**
+  * 对点云进行特征提取，提取Sharp、LessSharp、Flat、LessFlat四种特征点云
+  */
   /********Relative Variables*********/
   pcl::PointCloud<PointType>::Ptr surfPointsLessFlatScan;
   pcl::PointCloud<PointType>::Ptr surfPointsLessFlatScanDS;
@@ -952,47 +1005,69 @@ class StateEstimator {
     }
   }
 
+  /**
+   * 遍历在Corner特征点云，上一帧Corner特征点云中找到当前点p的最近点a和次近点b，
+   * 然后获得点p到线段ab的垂线向量和距离，保存在jacobianCoff中，对应的当前点p保
+   * 存在keypoints中
+   * @param lastScan 上一帧特征点云
+   * @param newScan 当前特征点云
+   * @param keypoints 在上一帧点云中找到了最近点的当前点
+   * @param jacobianCoff 点p到线段ab的垂线向量和距离
+   * @param iterCount 迭代次数
+   * @return 无
+   */
   void findCorrespondingCornerFeatures(
       ScanPtr lastScan, ScanPtr newScan,
       pcl::PointCloud<PointType>::Ptr keypoints,
       pcl::PointCloud<PointType>::Ptr jacobianCoff, int iterCount) {
     int cornerPointsSharpNum = newScan->cornerPointsSharp_->points.size();
 
+	/* 遍历Corner特征点中的每一个点 */
     for (int i = 0; i < cornerPointsSharpNum; i++) {
       PointType pointSel;
       PointType coeff, tripod1, tripod2;
 
+	  /* 对点进行帧内校正，对齐到帧内第一个点 */
       transformToStart(&newScan->cornerPointsSharp_->points[i], &pointSel);
 
       pcl::PointCloud<PointType>::Ptr laserCloudCornerLast =
           lastScan->cornerPointsLessSharp_;
 
       if (iterCount % ICP_FREQ == 0) {
+		/* 在上一帧点云中找到与当前点最近的一个点， kdtreeCorner_是上一帧点云*/
         std::vector<int> pointSearchInd;
         std::vector<float> pointSearchSqDis;
         kdtreeCorner_->nearestKSearch(pointSel, 1, pointSearchInd,
                                       pointSearchSqDis);
         int closestPointInd = -1, minPointInd2 = -1;
 
+		/* 在最近的的基础上，遍历最近点附近的点，查找次近点 */
         if (pointSearchSqDis[0] < NEAREST_FEATURE_SEARCH_SQ_DIST) {
+		  /* 记录最近点的index */
           closestPointInd = pointSearchInd[0];
+		  /* 记录最近点的时间戳 */
           int closestPointScan =
               int(laserCloudCornerLast->points[closestPointInd].intensity);
 
+		  /* 从最近点开始，向后遍历上一帧点云中的点，找到与当前点最近的点，记录序号 */
           float pointSqDis, minPointSqDis2 = NEAREST_FEATURE_SEARCH_SQ_DIST;
           for (int j = closestPointInd + 1; j < cornerPointsSharpNum; j++) {
+			  
+			/* 如果该点距离最近点的时间戳超过2.5，则停止遍历 */
             if (int(laserCloudCornerLast->points[j].intensity) >
                 closestPointScan + 2.5) {
               break;
             }
 
+			/* 求该点与当前点的平方和，也就是距离平方 */
             pointSqDis = (laserCloudCornerLast->points[j].x - pointSel.x) *
-                             (laserCloudCornerLast->points[j].x - pointSel.x) +
+                         (laserCloudCornerLast->points[j].x - pointSel.x) +
                          (laserCloudCornerLast->points[j].y - pointSel.y) *
-                             (laserCloudCornerLast->points[j].y - pointSel.y) +
+                         (laserCloudCornerLast->points[j].y - pointSel.y) +
                          (laserCloudCornerLast->points[j].z - pointSel.z) *
-                             (laserCloudCornerLast->points[j].z - pointSel.z);
+                         (laserCloudCornerLast->points[j].z - pointSel.z);
 
+			/* 记录与当前点距离最小的点的序号在minPointInd2中 */
             if (int(laserCloudCornerLast->points[j].intensity) >
                 closestPointScan) {
               if (pointSqDis < minPointSqDis2) {
@@ -1001,6 +1076,8 @@ class StateEstimator {
               }
             }
           }
+		  
+		  /* 从最近点开始，向前遍历上一帧点云中的点，找到与当前点最近的点，记录序号 */
           for (int j = closestPointInd - 1; j >= 0; j--) {
             if (int(laserCloudCornerLast->points[j].intensity) <
                 closestPointScan - 2.5) {
@@ -1008,11 +1085,11 @@ class StateEstimator {
             }
 
             pointSqDis = (laserCloudCornerLast->points[j].x - pointSel.x) *
-                             (laserCloudCornerLast->points[j].x - pointSel.x) +
+                         (laserCloudCornerLast->points[j].x - pointSel.x) +
                          (laserCloudCornerLast->points[j].y - pointSel.y) *
-                             (laserCloudCornerLast->points[j].y - pointSel.y) +
+                         (laserCloudCornerLast->points[j].y - pointSel.y) +
                          (laserCloudCornerLast->points[j].z - pointSel.z) *
-                             (laserCloudCornerLast->points[j].z - pointSel.z);
+                         (laserCloudCornerLast->points[j].z - pointSel.z);
 
             if (int(laserCloudCornerLast->points[j].intensity) <
                 closestPointScan) {
@@ -1024,7 +1101,9 @@ class StateEstimator {
           }
         }
 
+		/* 通过kdtree找到的最近点 */
         pointSearchCornerInd1[i] = closestPointInd;
+		/* 通过遍历最近点附近的点找到的次近点 */
         pointSearchCornerInd2[i] = minPointInd2;
       }
 
@@ -1032,18 +1111,25 @@ class StateEstimator {
         tripod1 = laserCloudCornerLast->points[pointSearchCornerInd1[i]];
         tripod2 = laserCloudCornerLast->points[pointSearchCornerInd2[i]];
 
+		/* P0是当前帧点云中的当前点，P1和P2是上一帧点云中的最近点和次近点，构成线段P1P2 */
         V3D P0xyz(pointSel.x, pointSel.y, pointSel.z);
         V3D P1xyz(tripod1.x, tripod1.y, tripod1.z);
         V3D P2xyz(tripod2.x, tripod2.y, tripod2.z);
 
+		/* 求线段P0P1和P0P2的叉乘结果 */
         V3D P = math_utils::skew(P0xyz - P1xyz) * (P0xyz - P2xyz);
+		/* r是平行四边形的面积 */
         float r = P.norm();
+		/* 求P1P2长度 */
         float d12 = (P1xyz - P2xyz).norm();
+		/* 平行四边形面积除以P1P2长度，得到点P0到线段P1P2的距离 */
         float res = r / d12;
 
+		/* 叉乘向量P再次和P2P1叉乘，得到点P0到线段P1P2的垂线 */
         V3D jacxyz =
             P.transpose() * math_utils::skew(P2xyz - P1xyz) / (d12 * r);
 
+		/* 设置阻尼因子 */
         float s = 1;
         if (iterCount >= ICP_FREQ) {
           s = 1 - 1.8 * fabs(res);
@@ -1053,29 +1139,41 @@ class StateEstimator {
           coeff.x = s * jacxyz(0);
           coeff.y = s * jacxyz(1);
           coeff.z = s * jacxyz(2);
-          coeff.intensity = s * res;
+          coeff.intensity = s * res; /* intensity记录当前点P到特征点线段ab的距离，带阻尼 */
 
+		  /* keypoints记录哪些在上一帧点云中找到了最近点的当前点 */
           keypoints->push_back(newScan->cornerPointsSharp_->points[i]);
+		  /* jacobianCoff记录当前点p到上一帧点云最近点线段ab的垂线向量，以及距离 */
           jacobianCoff->push_back(coeff);
         }
       }
     }
   }
 
+ /**
+  * 完成点云的帧内校正，将所有点对齐到帧内第一个点
+  */
   // Undistort point cloud to the start frame
   void transformToStart(PointType const* const pi, PointType* const po) {
+	  
+	/* 获得当前点相对于整个点云帧的时间比例系数，intensity存储的是每个点的时间戳 */
     double s = (1.f / SCAN_PERIOD) * (pi->intensity - int(pi->intensity));
 
+	/* 构造点向量 */
     V3D P2xyz(pi->x, pi->y, pi->z);
+	/* 将四元数形式的旋转量转成类似轴角的向量，乘以时间比例系数，再还原成四元数R21xyz */
     V3D phi = Quat2axis(linState_.qbn_);
     Q4D R21xyz = axis2Quat(s * phi);
     R21xyz.normalized();
+	/* 平移量乘以时间比例系数 */
     V3D T112xyz = s * linState_.rn_;
+	/* 对当前点进行旋转平移变换 */
     V3D P1xyz = R21xyz * P2xyz + T112xyz;
 
     po->x = P1xyz.x();
     po->y = P1xyz.y();
     po->z = P1xyz.z();
+	/* 输出点的intensity仍然记录对应的时间戳 */
     po->intensity = pi->intensity;
   }
 
@@ -1176,6 +1274,8 @@ class StateEstimator {
         ROS_WARN("Insufficient matched surfs...");
         continue;
       }
+	  
+	  /* 在上一帧点云中与当前 */
       findCorrespondingCornerFeatures(lastScan, newScan, keypointCorns_,
                                       jacobianCoffCorns, iter);
       if (keypointCorns_->points.size() < 5) {

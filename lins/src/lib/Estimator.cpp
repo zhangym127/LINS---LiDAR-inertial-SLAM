@@ -26,12 +26,21 @@ LinsFusion::LinsFusion(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
 LinsFusion::~LinsFusion() { delete estimator; }
 
+/**
+ * 主程序的入口
+ */
 void LinsFusion::run() { initialization(); }
 
+/**
+ * 初始化并启动程序
+ */
 void LinsFusion::initialization() {
+	
+  /* 实例化ESKF滤波器类，以实现状态估计 */
   // Implement an iterative-ESKF Kalman filter class
   estimator = new StateEstimator();
 
+  /* 订阅IMU、点云、里程计等数据 */
   // Subscribe to IMU, segmented point clouds, and map-refined odometry feedback
   subMapOdom_ = pnh_.subscribe<nav_msgs::Odometry>(
       LIDAR_MAPPING_TOPIC, 5, &LinsFusion::mapOdometryCallback, this);
@@ -91,6 +100,9 @@ void LinsFusion::initialization() {
   ROS_INFO_STREAM("Subscribe to \033[1;32m---->\033[0m " << LIDAR_TOPIC);
 }
 
+/**
+ * 订阅点云的处理函数，只是将点云添加到缓冲中
+ */
 void LinsFusion::laserCloudCallback(
     const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg) {
   // Add a new segmented point cloud
@@ -121,6 +133,9 @@ void LinsFusion::mapOdometryCallback(
   V3D rpy = math_utils::Q2rpy(q_xyz);
 }
 
+/**
+ * 订阅IMU数据的处理函数，并且是整个LINS状态估计的主驱动函数
+ */
 void LinsFusion::imuCallback(const sensor_msgs::Imu::ConstPtr& imuMsg) {
   // Align IMU measurements from IMU frame to vehicle frame
   // two frames share same roll and pitch angles, but with a small
@@ -129,23 +144,31 @@ void LinsFusion::imuCallback(const sensor_msgs::Imu::ConstPtr& imuMsg) {
       imuMsg->linear_acceleration.z;
   gyr_raw_ << imuMsg->angular_velocity.x, imuMsg->angular_velocity.y,
       imuMsg->angular_velocity.z;
+  /* 定义IMU坐标系到车辆坐标系的欧拉角变换关系 */
   misalign_euler_angles_ << deg2rad(0.0), deg2rad(0.0),
       deg2rad(IMU_MISALIGN_ANGLE);
+  /* 将IMU数据从IMU坐标系转到车辆坐标系 */
   alignIMUtoVehicle(misalign_euler_angles_, acc_raw_, gyr_raw_, acc_aligned_,
                     gyr_aligned_);
 
+  /* 添加旋转后的IMU数据到缓冲中 */
   // Add a new IMU measurement
   Imu imu(imuMsg->header.stamp.toSec(), acc_aligned_, gyr_aligned_);
   imuBuf_.addMeas(imu, imuMsg->header.stamp.toSec());
 
+  /* 驱动ESFK状态估计 */
   // Trigger the Kalman filter
   performStateEstimation();
 }
 
+/**
+ * 处理第一帧点云数据，同时进行ESKF的初始化
+ */
 void LinsFusion::processFirstPointCloud() {
   // Use the most recent poing cloud to initialize the estimator
   pclBuf_.getLastTime(scan_time_);
 
+  /* 从缓冲中提取点云数据，并转成PCL格式 */
   sensor_msgs::PointCloud2::ConstPtr pclMsg;
   pclBuf_.getLastMeas(pclMsg);
   distortedPointCloud->clear();
@@ -164,10 +187,12 @@ void LinsFusion::processFirstPointCloud() {
   Imu imu;
   imuBuf_.getLastMeas(imu);
 
+  /* 初始化ESKF */
   // Initialize the iterative-ESKF by the first PCL
   estimator->processPCL(scan_time_, imu, distortedPointCloud, cloudInfoMsg,
                         outlierPointCloud);
 
+  //清理第一帧点云之前的数据
   // Clear all the PCLs before the initialization PCL
   pclBuf_.clean(estimator->getTime());
   cloudInfoBuf_.clean(estimator->getTime());
@@ -201,7 +226,12 @@ void LinsFusion::publishTopics() {
   publishOdometryYZX(scan_time_);
 }
 
+/**
+ * 处理点云数据，同时进行ESKF的predict和update
+ */
 bool LinsFusion::processPointClouds() {
+	
+  /* 从缓冲中提取点云数据，并转成PCL格式 */
   // Obtain the next PCL
   pclBuf_.itMeas_ = pclBuf_.measMap_.upper_bound(estimator->getTime());
   sensor_msgs::PointCloud2::ConstPtr pclMsg = pclBuf_.itMeas_->second;
@@ -224,20 +254,24 @@ bool LinsFusion::processPointClouds() {
     return false;
   }
 
+  /* 对两帧点云之间的IMU数据进行处理，利用ESKF进行状态估计 */
   // Propagate IMU measurements between two consecutive scans
   int imu_couter = 0;
   while (estimator->getTime() < scan_time_ &&
          (imuBuf_.itMeas_ = imuBuf_.measMap_.upper_bound(
               estimator->getTime())) != imuBuf_.measMap_.end()) {
+	/*  */
     double dt =
         std::min(imuBuf_.itMeas_->first, scan_time_) - estimator->getTime();
     Imu imu = imuBuf_.itMeas_->second;
+	/* 利用IMU数据进行ESKF的predict */
     estimator->processImu(dt, imu.acc, imu.gyr);
   }
 
   Imu imu;
   imuBuf_.getLastMeas(imu);
 
+  /* 利用点云数据进行ESKF的update */
   // Update the iterative-ESKF using a new PCL
   estimator->processPCL(scan_time_, imu, distortedPointCloud, cloudInfoMsg,
                         outlierPointCloud);
@@ -251,7 +285,11 @@ bool LinsFusion::processPointClouds() {
   return true;
 }
 
+/**
+ * 在IMU和点云数据的基础上，实施ESKF状态估计
+ */
 void LinsFusion::performStateEstimation() {
+  /* 确认IMU、点云等缓冲中都有数据 */
   if (imuBuf_.empty() || pclBuf_.empty() || cloudInfoBuf_.empty() ||
       outlierBuf_.empty())
     return;

@@ -504,6 +504,7 @@ class StateEstimator {
         }
       }
 
+	  /* 把所有的keypoints和jacobians汇总在一起 */
       // Sum up jocobians and residuals
       keypoints_->clear();
       jacobians_->clear();
@@ -512,24 +513,40 @@ class StateEstimator {
       (*jacobians_) += (*jacobianCoffSurfs);
       (*jacobians_) += (*jacobianCoffCorns);
 
+	  /* 根据keypoints的数量，为ESKF的update变量H、R、K、S分配空间
+       * 在这里，每个keypoints中的p点与上一帧点云对应的最近点的距离就是一个观测量，
+	   * 与一般的卡尔曼滤波只有几个观测量不同，这个ESKF的观测量的规模有点大。*/
       // Memery allocation
       const unsigned int DIM_OF_MEAS = keypoints_->points.size();
       residual_.resize(DIM_OF_MEAS);
+	  /* 测量函数 H */
       Hk_.resize(DIM_OF_MEAS, DIM_OF_STATE);
+	  /* 测量噪声 R */
       Rk_.resize(DIM_OF_MEAS, DIM_OF_MEAS);
+	  /* 卡尔曼增益 K */
       Kk_.resize(DIM_OF_STATE, DIM_OF_MEAS);
+	  /* 系统不确定性 S */
       Py_.resize(DIM_OF_MEAS, DIM_OF_MEAS);
       Pyinv_.resize(DIM_OF_MEAS, DIM_OF_MEAS);
 
+	  /* 构造观测变量z（即residual_），构造观测函数H */
       Hk_.setZero();
       V3D axis = Quat2axis(linState_.qbn_);
       for (int i = 0; i < DIM_OF_MEAS; ++i) {
+		  
+		/* keypoints_中保存的是当前特征点云中的关键点 */
         // Point represented in 2-frame (e.g., the end frame) in a
         // xyz-convention
         V3D P2xyz(keypoints_->points[i].x, keypoints_->points[i].y,
                   keypoints_->points[i].z);
+				  
+		/* jacobians_的(x,y,z)中保存的是当前特征点云中每个点p到上一帧点云最
+		 * 近线段ab的垂线向量 */
         V3D coff_xyz(jacobians_->points[i].x, jacobians_->points[i].y,
                      jacobians_->points[i].z);
+
+		/* jacobians_的intensity中保存的是当前特征点云中每个点p到上一帧点云
+		 * 最近线段ab的距离，也就是残差，也就是观测值z */
         residual_(i) = LIDAR_SCALE * jacobians_->points[i].intensity;
 
         Hk_.block<1, 3>(i, GlobalState::att_) =

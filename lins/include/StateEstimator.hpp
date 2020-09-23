@@ -519,7 +519,7 @@ class StateEstimator {
       // Memery allocation
       const unsigned int DIM_OF_MEAS = keypoints_->points.size();
       residual_.resize(DIM_OF_MEAS);
-	  /* 测量函数 H */
+	  /* 测量函数 H i×18 */
       Hk_.resize(DIM_OF_MEAS, DIM_OF_STATE);
 	  /* 测量噪声 R */
       Rk_.resize(DIM_OF_MEAS, DIM_OF_MEAS);
@@ -549,10 +549,12 @@ class StateEstimator {
 		 * 最近线段ab的距离，也就是残差，也就是观测值z */
         residual_(i) = LIDAR_SCALE * jacobians_->points[i].intensity;
 
+		/* H[i,6] = Vv * (-R * X) * R, */
         Hk_.block<1, 3>(i, GlobalState::att_) =
             coff_xyz.transpose() *
             (-linState_.qbn_.toRotationMatrix() * skew(P2xyz)) *
             Rinvleft(-axis);
+		/* H[i,0] =  */
         Hk_.block<1, 3>(i, GlobalState::pos_) =
             coff_xyz.transpose() * M3D::Identity();
       }

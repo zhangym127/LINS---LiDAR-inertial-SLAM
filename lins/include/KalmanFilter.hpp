@@ -154,7 +154,7 @@ class StatePredictor {
     state_tmp.rn_ = state_tmp.rn_ + dt * state_tmp.vn_ + 0.5 * dt * dt * un_acc;
     state_tmp.vn_ = state_tmp.vn_ + dt * un_acc;
 
-	/* 构造ESKF的雅克比矩阵Fx，即状态转移矩阵，或基本矩阵，尺度是18×18 */
+	/* 构造ESKF的雅可比矩阵Fx，即状态转移矩阵，或基本矩阵，尺度是18×18 */
     if (update_jacobian_) {
 	  /* 首先构造系统动力学矩阵A
 	   * FIXME: 与ESKF文献唯一有区别的地方是A[6,6]项，多了一个负号，为什么？ */

@@ -283,7 +283,8 @@ class StateEstimator {
     TicToc ts_fea;  // Calculate the time used in feature extraction
     scan_new_->setPointCloud(time, distortedPointCloud, cloudInfo,
                              outlierPointCloud);
-	/* 进行点云的帧内校正 */
+	/* 将点云从雷达坐标系转到车辆坐标系，并获得每个点的相对时间戳，保存在
+     * intensity字段的小数部分中。 */
     undistortPcl(scan_new_);
 	/* 计算点云的曲率 */
     calculateSmoothness(scan_new_);
@@ -492,10 +493,10 @@ class StateEstimator {
         }
       }
 	  
-	  /* 遍历当前特征点云，对点云中的每一个点p，在上一帧点云中查找最近的线段ab，
-	   * 将点p到ab的垂线向量以及距离构造成一个点，添加到jacobianCoffCorns中，对
-	   * 应的点p添加到keypointCorns_中，keypointCorns_和jacobianCoffCorns都是点
-	   * 云格式。*/
+	  /* 遍历Corner特征点云，基于linState_提供的帧间位姿变换量，对点进行帧内校正。
+	   * 然后在上一帧Corner特征点云中找到当前点p的最近点a和次近点b，再获得点p到线段
+       * ab的距离，也就是观测方程的结果，并求得观测方程的雅可比，保存在jacobianCoff
+       * 中，对应的当前点p保存在keypoints中。*/
       findCorrespondingCornerFeatures(scan_last_, scan_new_, keypointCorns_,
                                       jacobianCoffCorns, iter);
       if (keypointCorns_->points.size() < 5) {
@@ -540,25 +541,26 @@ class StateEstimator {
         V3D P2xyz(keypoints_->points[i].x, keypoints_->points[i].y,
                   keypoints_->points[i].z);
 				  
-		/* jacobians_的(x,y,z)中保存的是当前特征点云中每个点p到上一帧点云最
-		 * 近线段ab的垂线向量 */
+		/* jacobians_的(x,y,z)中保存的是观测方程的雅可比 */
         V3D coff_xyz(jacobians_->points[i].x, jacobians_->points[i].y,
                      jacobians_->points[i].z);
 
 		/* jacobians_的intensity中保存的是当前特征点云中每个点p到上一帧点云
-		 * 最近线段ab的距离，也就是残差，也就是观测值z */
+		 * 最近线段ab的距离，也就是观测值z */
         residual_(i) = LIDAR_SCALE * jacobians_->points[i].intensity;
 
-		/* H[i,6] = Vv * (-R * X) * R, */
+		/* 构造观测方程的雅可比 */
+		/* H[i,6] = coeff^T * (-R * X) * J(-θ)^(-1), */
         Hk_.block<1, 3>(i, GlobalState::att_) =
             coff_xyz.transpose() *
             (-linState_.qbn_.toRotationMatrix() * skew(P2xyz)) *
             Rinvleft(-axis);
-		/* H[i,0] =  */
+		/* H[i,0] = coeff^T * I */
         Hk_.block<1, 3>(i, GlobalState::pos_) =
             coff_xyz.transpose() * M3D::Identity();
       }
 
+	  /* 设置测量协方差矩阵，设置为雷达的标准差 */
       // Set the measurement covariance matrix
       VXD cov = VXD::Zero(DIM_OF_MEAS);
       for (int i = 0; i < DIM_OF_MEAS; ++i) {
@@ -567,28 +569,46 @@ class StateEstimator {
       Rk_ = cov.asDiagonal();
 
       // Kalman filter update. Details can be referred to ROVIO
-      Py_ =
-          Hk_ * Pk_ * Hk_.transpose() + Rk_;  // S = H * P * H.transpose() + R;
+      Py_ = Hk_ * Pk_ * Hk_.transpose() + Rk_;// S = H * P * H.transpose() + R;
+	  /**
+	   * 通过Cholesky分解（也叫LLT分解）求S的逆矩阵，令AX=I，求解X，X就是A的逆。
+	   * 下面首先令Pyinv_=I，然后通过LLT分解求解Py_*Pyinv_=I，Pyinv_就是Py_的逆。 */
       Pyinv_.setIdentity();                   // solve Ax=B
       Py_.llt().solveInPlace(Pyinv_);
       Kk_ = Pk_ * Hk_.transpose() * Pyinv_;  // K = P*H.transpose()*S.inverse()
 
+	  /**
+	   * filterState 是位姿状态的估计值或者先验，对应ESKF中的真实状态
+	   * linState_ 是基于观测值进行多轮迭代优化的后验，对应ESKF中的标称状态
+	   * linState_ 的初始值与filterState相同，与predict刚结束、update尚未开始时
+	   *	误差状态为0相对应。
+	   * difVecLinInv_ 是位姿状态先验与后验的差值，也就是误差状态的先验，初始值为0。
+	   * updateVec_ 是误差状态的后验，也就是引入观测值，更新后的误差状态。
+	   *
+	   * 在predict刚结束，update尚未开始的时候，误差状态为0，也就是还没有观测到。
+	   * 随着观测结果的引入，后验开始偏离先验，误差状态开始产生。然后通过将误差
+	   * 状态注入标称状态，并进行IESKF迭代优化，最终使得误差状态后验趋近于零。
+	   *
+	   * IESKF迭代优化的目标是误差状态的后验updateVec_趋近于0。
+	   */
+	  /* 通过先验（真实状态）减去后验（标称状态），获得误差状态的先验 */
 	  /* difVecLinInv_ = filterState - linState_ */
       filterState.boxMinus(linState_, difVecLinInv_);
-	  
+
 	  /* 下面的式子等效于：
 	   *	y=z-H*x
 	   *	x=x+K*y
 	   * 其中
-	   *    z <-- residual_
-	   *    H <-- Hk_
-	   *    x <-- difVecLinInv_
-	   *    K <-- Kk_
-	   *    x <-- updateVec_
-	   * updateVec_就是ESKF的观测误差状态，即误差状态的后验概率
+	   *    z      <-- residual_
+	   *    H      <-- Hk_
+	   *    δx先验 <-- difVecLinInv_
+	   *    K      <-- Kk_
+	   *    δx后验 <-- updateVec_
 	   */
+	  /* 通过引入观测值，更新误差状态，获得误差状态的后验 */
       updateVec_ = -Kk_ * (residual_ + Hk_ * difVecLinInv_) + difVecLinInv_;
-
+   
+	  /* 通过检查误差状态后验中是否存在无效值来判断是否发散 */
       // Divergence determination
       bool hasNaN = false;
       for (int i = 0; i < updateVec_.size(); i++) {
@@ -610,11 +630,12 @@ class StateEstimator {
         break;
       }
 
-	  /* 将观测误差注入标称状态 
+	  /* 将误差状态注入标称状态
 	   * linState_ = linState_ + updateVec_ */
       // Update the state
       linState_.boxPlus(updateVec_, linState_);
 
+	  /* 判断误差状态的后验是否趋近于零 */
       updateVecNorm_ = updateVec_.norm();
       if (updateVecNorm_ <= 1e-2) {
         hasConverged = true;
@@ -634,10 +655,12 @@ class StateEstimator {
       filterState.qbn_ = q;
       filter_->update(filterState, Pk_);
     } else {
+	  /* 更新协方差P，注意：在IEKF中，P值更新一次 */
       // Update only one time
       IKH_ = Eigen::Matrix<double, 18, 18>::Identity() - Kk_ * Hk_;
       Pk_ = IKH_ * Pk_ * IKH_.transpose() + Kk_ * Rk_ * Kk_.transpose();
       enforceSymmetry(Pk_);
+	  /* 将迭代优化后的标称状态和协方差写入滤波器 */
       filter_->update(linState_, Pk_);
     }
   }
@@ -660,8 +683,8 @@ class StateEstimator {
   }
 
   /**
-   * 进行点云的帧内校正。
-   * 但是从代码来看并未进行帧内校正。
+   * 将点云从雷达坐标系转到车辆坐标系，并获得每个点的相对时间戳，保存在
+   * intensity字段的小数部分中。
    */
   void undistortPcl(ScanPtr scan) {
     bool halfPassed = false;
@@ -694,9 +717,10 @@ class StateEstimator {
         else if (ori > segInfo->endOrientation + M_PI / 2)
           ori -= 2 * M_PI;
       }
+	  /* 根据该点的方位获得在帧内的时间比例系数，再乘以帧周期就是该点在帧内的相对时间戳 */
       double relTime =
           (ori - segInfo->startOrientation) / segInfo->orientationDiff;
-	  /* 将点的时间戳写入intensity字段 */
+	  /* 将点的时间戳写入intensity字段的小数部分，这个时间戳是帧内相对时间戳 */
       point.intensity =
           int(distPointCloud->points[i].intensity) + SCAN_PERIOD * relTime;
 
@@ -1025,14 +1049,18 @@ class StateEstimator {
   }
 
   /**
-   * 遍历在Corner特征点云，上一帧Corner特征点云中找到当前点p的最近点a和次近点b，
-   * 然后获得点p到线段ab的垂线向量和距离，保存在jacobianCoff中，对应的当前点p保
-   * 存在keypoints中
+   * 遍历Corner特征点云，基于linState_提供的帧间位姿变换量，对点进行帧内校正。
+   * 然后在上一帧Corner特征点云中找到当前点p的最近点a和次近点b，再获得点p到线段
+   * ab的距离，也就是观测方程的结果，并求得观测方程的雅可比，保存在jacobianCoff
+   * 中，对应的当前点p保存在keypoints中。
    * @param lastScan 上一帧特征点云
    * @param newScan 当前特征点云
-   * @param keypoints 在上一帧点云中找到了最近点的当前点
-   * @param jacobianCoff 点p到线段ab的垂线向量和距离
+   * @param keypoints 在上一帧点云中找到了最近点的当前点，也就是点p
+   * @param jacobianCoff 每个点的intensity保存点p到线段ab的距离，也就是观测方程
+   *   的结果; 每个点的x,y,z中保存观测方程的雅可比向量。
    * @param iterCount 迭代次数
+   * @param linState_ 这个参数是全局变量，因此没有出现在参数表中，但是非常重要，
+   *	保存了两帧点云间的位姿变换量。
    * @return 无
    */
   void findCorrespondingCornerFeatures(
@@ -1046,7 +1074,7 @@ class StateEstimator {
       PointType pointSel;
       PointType coeff, tripod1, tripod2;
 
-	  /* 对点进行帧内校正，对齐到帧内第一个点 */
+	  /* 基于linState_提供的帧间位姿变换量，对点进行帧内校正，对齐到帧内第一个点 */
       transformToStart(&newScan->cornerPointsSharp_->points[i], &pointSel);
 
       pcl::PointCloud<PointType>::Ptr laserCloudCornerLast =
@@ -1175,7 +1203,8 @@ class StateEstimator {
   // Undistort point cloud to the start frame
   void transformToStart(PointType const* const pi, PointType* const po) {
 	  
-	/* 获得当前点相对于整个点云帧的时间比例系数，intensity存储的是每个点的时间戳 */
+	/* 获得当前点相对于整个点云帧的时间比例系数，intensity的小数部分存储的
+	 * 是每个点的时间戳 */
     double s = (1.f / SCAN_PERIOD) * (pi->intensity - int(pi->intensity));
 
 	/* 构造点向量 */

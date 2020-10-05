@@ -110,7 +110,7 @@ class GlobalState {
   // !@State ESKF的标称状态变量X
   V3D rn_;   // position in n-frame 当前位置
   V3D vn_;   // velocity in n-frame 当前速度
-  Q4D qbn_;  // rotation from b-frame to n-frame 从起点到当前的旋转
+  Q4D qbn_;  // rotation from b-frame to n-frame 从当前帧(k+1)到前一帧(k)的旋转
   V3D ba_;   // acceleartion bias 加速度偏差
   V3D bw_;   // gyroscope bias 角速度偏差
   V3D gn_;   // gravity 重力加速度
@@ -123,7 +123,12 @@ class StatePredictor {
 
   ~StatePredictor() {}
 
-  /** ESKF的预测过程 */
+  /** 
+   * ESKF的预测过程（高频）
+   * 基于IMU的加速度和角速度预测状态变量。每收到一帧IMU数据，本函数就会执行一次，
+   * 在相邻两个点云帧之间本预测过程会执行多次，完成位置和姿态的积分，完成协方差的
+   * 更新。
+   */
   bool predict(double dt, const V3D& acc, const V3D& gyr,
                bool update_jacobian_ = true) {
     if (!isInitialized()) return false;
@@ -134,6 +139,11 @@ class StatePredictor {
       gyr_last = gyr;
     }
 
+	/** 
+     * 由于ESKF在每个点云帧周期结束的时候都要进行reset，将位置和姿态清零，因此
+	 * ESKF每周期预测和更新起点的都是上一(k)帧点云的结束时刻，或者当前(k)帧点云
+	 * 的起始时刻。
+     */
     // Average acceleration and angular rate
     GlobalState state_tmp = state_;
 	/* 将前一状态的acc转到世界坐标系，考虑偏差和重力加速度在内 */
@@ -144,7 +154,7 @@ class StatePredictor {
     Q4D dq = axis2Quat(un_gyr * dt);
 	/* 将旋转增量叠加到已有的旋转状态变量，获得当前状态对应的旋转变量 */
     state_tmp.qbn_ = (state_tmp.qbn_ * dq).normalized();
-	/* 将当前状态的acc转到世界坐标系，考虑偏差和重力加速度在内 */
+	/* 将当前状态的acc转到上一帧的初始状态，考虑偏差和重力加速度在内 */
     V3D un_acc_1 = state_tmp.qbn_ * (acc - state_tmp.ba_) + state_tmp.gn_;
 	/* 对转成世界坐标系的前一状态acc和当前状态acc求均值 */
     V3D un_acc = 0.5 * (un_acc_0 + un_acc_1);
@@ -191,7 +201,11 @@ class StatePredictor {
           MXD::Identity(GlobalState::DIM_OF_STATE_, GlobalState::DIM_OF_STATE_);
       F_ = I + Ft * dt + 0.5 * Ft * Ft * dt * dt;
 
-	  // 下面的步骤被省略
+	  /**
+	   * 在ESKF中，预测过程结束，获得状态变量的先验时，认为误差状态是0。此时由于尚未进行
+	   * 观测，所以误差是看不到的，只有在更新过程中，引入了观测值，误差才会显现出来。因此
+	   * 在观测过程中，用状态转移矩阵F更新误差状态变量的步骤被省略，仅仅是更新协方差矩阵P。
+	   */ 
 	  // δx = F * δx
       // jacobian_ = F * jacobian_;
 	  /* P = F * P * F.transpose() + Q */
@@ -333,6 +347,17 @@ class StatePredictor {
     noise_.block<3, 3>(9, 9) = V3D(pwebg, pwebg, pwebg).asDiagonal();
   }
 
+  /** 
+   * 对ESKF状态变量进行复位。
+   * =更新状态变量x
+   *  -位置清零
+   *  -速度方位更新
+   *  -旋转清零
+   *  -加速度偏差不变
+   *  -角速度偏差不变
+   *  -重力加速度方位更新
+   * =更新协方差矩阵P
+   */
   void reset(int type = 0) {
     if (type == 0) {
       state_.rn_.setZero();
@@ -340,6 +365,8 @@ class StatePredictor {
       state_.qbn_.setIdentity();
       initializeCovariance();
     } else if (type == 1) {
+		
+	  /** 更新协方差矩阵P */
       V3D covPos = INIT_POS_STD.array().square();
       double covRoll = pow(deg2rad(INIT_ATT_STD(0)), 2);
       double covPitch = pow(deg2rad(INIT_ATT_STD(1)), 2);
@@ -355,22 +382,29 @@ class StatePredictor {
           covariance_.block<3, 3>(GlobalState::gra_, GlobalState::gra_);
 
       covariance_.setZero();
+	  /** P[0,0] = 位置标准差INIT_POS_STD */
       covariance_.block<3, 3>(GlobalState::pos_, GlobalState::pos_) =
           covPos.asDiagonal();  // pos
+	  /** P[3,3] = q^(-1) * v * q */
       covariance_.block<3, 3>(GlobalState::vel_, GlobalState::vel_) =
           state_.qbn_.inverse() * vel_cov * state_.qbn_;  // vel
+	  /** P[6,6] = 旋转标准差INIT_ATT_STD */
       covariance_.block<3, 3>(GlobalState::att_, GlobalState::att_) =
           V3D(covRoll, covPitch, covYaw).asDiagonal();  // att
+	  /** P[9,9] = P[9,9] */
       covariance_.block<3, 3>(GlobalState::acc_, GlobalState::acc_) = acc_cov;
+	  /** P[12,12] = P[12,12] */
       covariance_.block<3, 3>(GlobalState::gyr_, GlobalState::gyr_) = gyr_cov;
+	  /** P[15,15] = q^(-1) * P[15,15] * q */
       covariance_.block<3, 3>(GlobalState::gra_, GlobalState::gra_) =
           state_.qbn_.inverse() * gra_cov * state_.qbn_;
 
-      state_.rn_.setZero();
-      state_.vn_ = state_.qbn_.inverse() * state_.vn_;
-      state_.qbn_.setIdentity();
-      state_.gn_ = state_.qbn_.inverse() * state_.gn_;
-      state_.gn_ = state_.gn_ * 9.81 / state_.gn_.norm();
+	  /** 更新状态变量x */
+      state_.rn_.setZero(); 								/** 位置清零 */
+      state_.vn_ = state_.qbn_.inverse() * state_.vn_; 		/** 速度更新 */
+      state_.qbn_.setIdentity(); 							/** 旋转清零 */
+      state_.gn_ = state_.qbn_.inverse() * state_.gn_;		/** 重力加速度方位更新 */
+      state_.gn_ = state_.gn_ * 9.81 / state_.gn_.norm(); 	
       // initializeCovariance(1);
     }
   }

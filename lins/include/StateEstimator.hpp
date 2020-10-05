@@ -444,12 +444,18 @@ class StateEstimator {
       return false;
     }
 
+	/** 进行IESKF的Update过程，对当前(k+1)帧与上一(k)帧之间的位姿变化量进行校正 */
     // Update states
     performIESKF();
+	/** 将校正后的帧间位姿变化量叠加到位姿的全局状态变量中 */
     // Update global transform by estimated relative transform
     integrateTransformation();
+	/** 将ESKF复位 */
     filter_->reset(1);
 
+	/** 
+	 * 根据重力加速度的方向直接计算出roll和pitch的值，并更新globalState_中的roll
+	 * 和pitch */
     double roll, pitch;
     // Because the estimated gravity is represented in the b-frame, we can
     // directly solve more accurate roll and pitch angles to correct the global
@@ -457,9 +463,14 @@ class StateEstimator {
     calculateRPfromGravity(filter_->state_.gn_, roll, pitch);
     correctRollPitch(roll, pitch);
 
+    /** 
+     * 对当前帧特征点云进行变换，使所有点向帧的结束时刻看齐，然后添加到kdTree中，
+     * 为与下一帧点云的匹配做好准备。
+     */
     // Undistort point cloud using estimated relative transform
     updatePointCloud();
 
+    /** 当前帧点云切换为上一帧点云 */
     // Slide the new scan to last scan
     scan_last_.swap(scan_new_);
     scan_new_.reset(new Scan());
@@ -467,7 +478,15 @@ class StateEstimator {
     return true;
   }
 
+  /** 
+   * ESKF的更新过程（低频）
+   * 更新当前(k+1)帧点云相对于上一(k)帧终点的位姿变换，或者说：
+   * 更新当前帧点云终点相对于当前帧点云起点的位姿变换。
+   */
   void performIESKF() {
+	  
+	/** 获得当前的协方差P和状态变量，状态变量是自上一帧点云终点起到当前
+	 * 帧点云终点累计的位姿预测（积分）结果 */
     // Store current state and perform initialization
     Pk_ = filter_->covariance_;
     GlobalState filterState = filter_->state_;
@@ -477,6 +496,14 @@ class StateEstimator {
     bool hasConverged = false;
     bool hasDiverged = false;
     const unsigned int DIM_OF_STATE = GlobalState::DIM_OF_STATE_;
+	
+	/**
+	 * 下面进行迭代ESKF，即IESKF过程
+	 * 在每一次迭代中，首先用状态变量的标称状态linState_对点云进行帧内校正，使当
+	 * 前帧内所有点向帧的起始时刻看齐，然后通过观测方程计算两帧点云的位姿偏差及其
+	 * 雅可比，基于偏差和雅可比获得误差状态的后验，并将后验注入标称状态linState_
+	 * 如果误差状态的后验没有趋近于零，则重复上述过程，直至趋近于零。
+	 */
     for (int iter = 0; iter < NUM_ITER && !hasConverged && !hasDiverged;
          iter++) {
       keypointSurfs_->clear();
@@ -484,6 +511,16 @@ class StateEstimator {
       keypointCorns_->clear();
       jacobianCoffCorns->clear();
 
+      /**
+       * 遍历特征点云，基于linState_提供的帧间位姿变换量，对点进行帧内校正，使帧
+	   * 内所有点向帧的起始时刻看齐。然后在上一帧特征点云的kdtree中找到当前点p的
+	   * 最近点a和次近点b，再获得点p到线段ab的距离，也就是观测方程的结果，并求得
+	   * 观测方程的雅可比，保存在jacobianCoff中，对应的当前点p保存在keypoints中。
+	   * 
+	   * 由于上一帧点云已经向帧的结束时刻（即当前帧的起始时刻）看齐，因此理论上两
+	   * 帧点云应该完全重合，观测方程的结果为0才对。但是位姿的估计值肯定是存在误差
+	   * 的，这个误差只有通过引入观测值才能显现出来。
+	   */
       // Find corresponding features
       findCorrespondingSurfFeatures(scan_last_, scan_new_, keypointSurfs_,
                                     jacobianCoffSurfs, iter);
@@ -493,10 +530,6 @@ class StateEstimator {
         }
       }
 	  
-	  /* 遍历Corner特征点云，基于linState_提供的帧间位姿变换量，对点进行帧内校正。
-	   * 然后在上一帧Corner特征点云中找到当前点p的最近点a和次近点b，再获得点p到线段
-       * ab的距离，也就是观测方程的结果，并求得观测方程的雅可比，保存在jacobianCoff
-       * 中，对应的当前点p保存在keypoints中。*/
       findCorrespondingCornerFeatures(scan_last_, scan_new_, keypointCorns_,
                                       jacobianCoffCorns, iter);
       if (keypointCorns_->points.size() < 5) {
@@ -579,9 +612,9 @@ class StateEstimator {
 
 	  /**
 	   * filterState 是位姿状态的估计值或者先验，对应ESKF中的真实状态
-	   * linState_ 是基于观测值进行多轮迭代优化的后验，对应ESKF中的标称状态
-	   * linState_ 的初始值与filterState相同，与predict刚结束、update尚未开始时
-	   *	误差状态为0相对应。
+	   * linState_ 是基于观测值进行多轮迭代优化的后验，对应ESKF中的标称状态。
+	   * linState_ 的初值与filterState相同，这与ESKF的预测过程刚结束、更新过程尚未
+	   *	开始时误差状态为0相对应。
 	   * difVecLinInv_ 是位姿状态先验与后验的差值，也就是误差状态的先验，初始值为0。
 	   * updateVec_ 是误差状态的后验，也就是引入观测值，更新后的误差状态。
 	   *
@@ -591,8 +624,13 @@ class StateEstimator {
 	   *
 	   * IESKF迭代优化的目标是误差状态的后验updateVec_趋近于0。
 	   */
-	  /* 通过先验（真实状态）减去后验（标称状态），获得误差状态的先验 */
-	  /* difVecLinInv_ = filterState - linState_ */
+	  /**
+       * 通过先验（真实状态）减去后验（标称状态），获得误差状态的先验
+	   * FIXME：刚开始的时候后验与先验一致，误差状态为0，随着迭代的推进，误差显现，
+	   * 后验与先验分离，误差状态的先验也越来越大。这个先验会对后验的计算造成怎样
+	   * 的影响？
+	   */
+	  /** difVecLinInv_ = filterState - linState_ */
       filterState.boxMinus(linState_, difVecLinInv_);
 
 	  /* 下面的式子等效于：
@@ -630,12 +668,15 @@ class StateEstimator {
         break;
       }
 
-	  /* 将误差状态注入标称状态
+	  /* 将误差状态后验注入标称状态
 	   * linState_ = linState_ + updateVec_ */
       // Update the state
       linState_.boxPlus(updateVec_, linState_);
 
-	  /* 判断误差状态的后验是否趋近于零 */
+	  /** 
+	   * 判断误差状态的后验是否趋近于零，如果没有，则用更新后的标称状态linState_
+	   * 对当前点云进行帧内校正，用校正后的点云重新计算观测方程的结果及其雅可比，
+       * 再计算出新的误差状态。重复上述过程，直到误差状态后验趋近于零。*/
       updateVecNorm_ = updateVec_.norm();
       if (updateVecNorm_ <= 1e-2) {
         hasConverged = true;
@@ -655,10 +696,13 @@ class StateEstimator {
       filterState.qbn_ = q;
       filter_->update(filterState, Pk_);
     } else {
-	  /* 更新协方差P，注意：在IEKF中，P值更新一次 */
+	  /** 
+	   * 更新协方差P，注意：在IEKF的更新过程中，状态变量更新多次，但是P只更新
+	   * 一次 */
       // Update only one time
       IKH_ = Eigen::Matrix<double, 18, 18>::Identity() - Kk_ * Hk_;
       Pk_ = IKH_ * Pk_ * IKH_.transpose() + Kk_ * Rk_ * Kk_.transpose();
+	  /* 将P强制成对称矩阵 */
       enforceSymmetry(Pk_);
 	  /* 将迭代优化后的标称状态和协方差写入滤波器 */
       filter_->update(linState_, Pk_);
@@ -670,6 +714,9 @@ class StateEstimator {
     roll = sign(fbib.z()) * asin(fbib.y() / G0);
   }
 
+  /**
+   * 将IESKF的update的当前帧结果叠加到位姿的全局状态变量中
+   */
   // Update the gloabl state by the new relative transformation
   void integrateTransformation() {
     GlobalState filterState = filter_->state_;
@@ -1225,6 +1272,9 @@ class StateEstimator {
     po->intensity = pi->intensity;
   }
 
+  /**
+   * 完成点云的帧内校正，将所有点对齐到帧内最后一个点
+   */
   // Undistort point cloud to the end frame
   void transformToEnd(PointType const* const pi, PointType* const po) {
     double s = (1.f / SCAN_PERIOD) * (pi->intensity - int(pi->intensity));
@@ -1259,11 +1309,18 @@ class StateEstimator {
     po->intensity = pi->intensity;
   }
 
+  /** 
+   * 对当前帧特征点云进行变换，使所有点向帧内最后一个点看齐
+   * 然后添加到kdTree中，为与下一帧点云的匹配做好准备
+   */
   void updatePointCloud() {
     scan_new_->cornerPointsLessSharpYZX_->clear();
     scan_new_->surfPointsLessFlatYZX_->clear();
     scan_new_->outlierPointCloudYZX_->clear();
 
+	/** 
+     * 对当前帧特征点云进行帧内校正，使所有点向最后一个点看齐
+	 */
     PointType point;
     for (int i = 0; i < scan_new_->cornerPointsLessSharp_->points.size(); i++) {
       transformToEnd(&scan_new_->cornerPointsLessSharp_->points[i],
@@ -1299,6 +1356,9 @@ class StateEstimator {
     globalStateYZX_.qbn_ =
         Q_xyz_to_yzx * globalState_.qbn_ * Q_xyz_to_yzx.inverse();
 
+	/** 
+     * 将已经完成转换的特征点云添加到kdTree中，以便下一帧点云进行位姿匹配
+	 */
     if (scan_new_->cornerPointsLessSharp_->points.size() >= 5 &&
         scan_new_->surfPointsLessFlat_->points.size() >= 20) {
       kdtreeCorner_->setInputCloud(scan_new_->cornerPointsLessSharp_);
